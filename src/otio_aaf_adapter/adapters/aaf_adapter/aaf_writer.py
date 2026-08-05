@@ -6,6 +6,7 @@
 Specifies how to transcribe an OpenTimelineIO file into an AAF file.
 """
 from . import hooks
+from . import timewarp
 
 from pathlib import Path
 from typing import Tuple
@@ -427,7 +428,8 @@ class _TrackTranscriber:
             return transition
         elif isinstance(otio_child, otio.schema.Clip):
             source_clip = self.aaf_sourceclip(otio_child)
-            return source_clip
+            return timewarp.wrap_input_segment(
+                self.aaf_file, otio_child, source_clip, self.media_kind)
         elif isinstance(otio_child, otio.schema.Track):
             sequence = self.aaf_sequence(otio_child)
             return sequence
