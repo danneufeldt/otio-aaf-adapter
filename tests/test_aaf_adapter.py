@@ -10,6 +10,7 @@ import unittest
 import tempfile
 import io
 import contextlib
+from fractions import Fraction
 from pathlib import Path
 
 import opentimelineio as otio
@@ -18,6 +19,7 @@ from otio_aaf_adapter.adapters.aaf_adapter.aaf_writer import (
     AAFValidationError
 )
 from otio_aaf_adapter.adapters.aaf_adapter import hooks
+from otio_aaf_adapter.adapters.aaf_adapter import timewarp
 
 # module needs to be imported for code coverage to work
 import otio_aaf_adapter.adapters.advanced_authoring_format  # noqa: F401
@@ -2765,6 +2767,187 @@ class AAFWriterTests(unittest.TestCase):
             aaf_clip = aaf_clips.get(ref_clip.name)
             self.assertIsNotNone(aaf_clip)
             self.assertEqual(aaf_clip.source_range, ref_clip.source_range)
+
+
+class TimewarpWriterTests(unittest.TestCase):
+    """Round trips of Avid Motion Control time warps (aaf_adapter/timewarp.py)."""
+
+    TIMEWARP_SAMPLES = (
+        TIME_WARP_TEST_SUITE_PATH,
+        LINEAR_SPEED_EFFECTS_EXAMPLE_PATH,
+        MISC_SPEED_EFFECTS_EXAMPLE_PATH,
+    )
+
+    @staticmethod
+    def _motion_control_groups(aaf_path):
+        """(SpeedRatio, output length, input length, OffsetMapAdjust) for every
+        Motion Control OperationGroup in the file's composition mobs.
+        """
+        groups = []
+        with aaf2.open(aaf_path) as aaf_file:
+            for comp in aaf_file.content.compositionmobs():
+                for slot in comp.slots:
+                    pending = [slot.segment]
+                    while pending:
+                        segment = pending.pop()
+                        if (isinstance(segment, aaf2.components.OperationGroup)
+                                and segment.operation.name == "Motion Control"):
+                            params = {p.name: p for p in segment.parameters}
+                            adjust = None
+                            if "OpGroupMotionCtlOffsetMapAdjust" in segment.keys():
+                                adjust = str(
+                                    segment["OpGroupMotionCtlOffsetMapAdjust"].value)
+                            groups.append((
+                                str(params["SpeedRatio"].value),
+                                segment.length,
+                                segment.segments[0].length,
+                                adjust,
+                            ))
+                        for attr in ("components", "segments"):
+                            pending.extend(getattr(segment, attr, None) or [])
+        return groups
+
+    @staticmethod
+    def _timewarp_clip_count(timeline):
+        return sum(
+            1 for clip in timeline.find_clips() for effect in clip.effects
+            if effect.metadata.get("AAF", {}).get("Operation", {}).get("IsTimeWarp")
+        )
+
+    def _round_trip(self, timeline, **kwargs):
+        fd, tmp_aaf_path = tempfile.mkstemp(prefix="timewarp_", suffix=".aaf")
+        os.close(fd)
+        self.addCleanup(os.remove, tmp_aaf_path)
+        otio.adapters.write_to_file(
+            timeline, tmp_aaf_path, use_empty_mob_ids=True, **kwargs)
+        return self._motion_control_groups(tmp_aaf_path)
+
+    def _assert_subset_of_source(self, written, source, sample_path):
+        remaining = list(source)
+        for group in written:
+            self.assertIn(group, remaining,
+                          "{} not found in {}".format(group, sample_path))
+            remaining.remove(group)
+
+    def test_timewarp_lengths_match_source(self):
+        """Every time warp is written with the same output and input
+        (source) lengths as the matching group in the original Avid AAF.
+        """
+        for sample_path in self.TIMEWARP_SAMPLES:
+            with self.subTest(sample=os.path.basename(sample_path)):
+                timeline = otio.adapters.read_from_file(sample_path)
+                written = self._round_trip(timeline)
+                self.assertEqual(len(written), self._timewarp_clip_count(timeline))
+                source = [g[:3] for g in self._motion_control_groups(sample_path)]
+                self._assert_subset_of_source(
+                    [g[:3] for g in written], source, sample_path)
+
+    @staticmethod
+    def _motion_control_keyframes(aaf_path):
+        """(SpeedRatio, output length, keyframes) for every Motion Control
+        OperationGroup, with keyframe times and values as exact Fractions.
+        """
+        groups = []
+        with aaf2.open(aaf_path) as aaf_file:
+            for comp in aaf_file.content.compositionmobs():
+                for slot in comp.slots:
+                    pending = [slot.segment]
+                    while pending:
+                        segment = pending.pop()
+                        if (isinstance(segment, aaf2.components.OperationGroup)
+                                and segment.operation.name == "Motion Control"):
+                            params = {p.name: p for p in segment.parameters}
+                            keyframes = tuple(sorted(
+                                (name, tuple(
+                                    (Fraction(point.time), Fraction(point.value))
+                                    for point in param["PointList"]
+                                ))
+                                for name, param in params.items()
+                                if isinstance(param, aaf2.misc.VaryingValue)
+                            ))
+                            groups.append((
+                                str(params["SpeedRatio"].value),
+                                segment.length,
+                                keyframes,
+                            ))
+                        for attr in ("components", "segments"):
+                            pending.extend(getattr(segment, attr, None) or [])
+        return groups
+
+    def test_timewarp_keyframes_match_source_exactly(self):
+        """Speed and offset map keyframes are written back with the exact
+        rational values stored in the original Avid AAF.
+        """
+        for sample_path in self.TIMEWARP_SAMPLES:
+            with self.subTest(sample=os.path.basename(sample_path)):
+                timeline = otio.adapters.read_from_file(sample_path)
+                fd, tmp_aaf_path = tempfile.mkstemp(
+                    prefix="timewarp_kf_", suffix=".aaf")
+                os.close(fd)
+                self.addCleanup(os.remove, tmp_aaf_path)
+                otio.adapters.write_to_file(
+                    timeline, tmp_aaf_path, use_empty_mob_ids=True)
+                self._assert_subset_of_source(
+                    self._motion_control_keyframes(tmp_aaf_path),
+                    self._motion_control_keyframes(sample_path),
+                    sample_path,
+                )
+
+    def test_timewarp_float_to_rational(self):
+        as_rational = timewarp._as_rational
+        int32_max = 0x7FFFFFFF
+        # Decimal-based Avid value whose exact binary float doesn't fit int32.
+        self.assertEqual(Fraction(as_rational(800.952954)),
+                         Fraction(400476477, 500000))
+        # Repeating values come back as the simple fraction.
+        self.assertEqual(Fraction(as_rational(8 / 7)), Fraction(8, 7))
+        self.assertEqual(Fraction(as_rational(-1 / 3)), Fraction(-1, 3))
+        # Values that need approximating stay within int32 and stay close.
+        for value in (123456.123456789, 2147483.5, 0.000123456789123):
+            result = as_rational(value)
+            self.assertLessEqual(abs(result.numerator), int32_max)
+            self.assertLessEqual(result.denominator, int32_max)
+            self.assertAlmostEqual(float(result), value, places=4)
+        # Non-float values pass straight through.
+        self.assertEqual(Fraction(as_rational("100/99")), Fraction(100, 99))
+        self.assertEqual(Fraction(as_rational(3)), Fraction(3))
+
+    def test_timewarp_offset_map_adjust_off_by_default(self):
+        timeline = otio.adapters.read_from_file(TIME_WARP_TEST_SUITE_PATH)
+        written = self._round_trip(timeline)
+        self.assertTrue(written)
+        self.assertEqual({g[3] for g in written}, {None})
+
+    def test_timewarp_offset_map_adjust_flag(self):
+        """With the flag set, OpGroupMotionCtlOffsetMapAdjust is written back
+        with the original values (several are non-zero in this sample).
+        """
+        timeline = otio.adapters.read_from_file(TIME_WARP_TEST_SUITE_PATH)
+        written = self._round_trip(timeline, timewarp_offset_map_adjust=True)
+        self.assertGreater(len({g[3] for g in written} - {"0"}), 1)
+        self._assert_subset_of_source(
+            written,
+            self._motion_control_groups(TIME_WARP_TEST_SUITE_PATH),
+            TIME_WARP_TEST_SUITE_PATH,
+        )
+
+    def test_timewarp_without_speed_ratio_is_skipped(self):
+        """A time warp that can't be reconstructed is dropped with a warning
+        instead of failing the whole export.
+        """
+        timeline = otio.adapters.read_from_file(MISC_SPEED_EFFECTS_EXAMPLE_PATH)
+        expected = self._timewarp_clip_count(timeline)
+        broken = next(
+            effect for clip in timeline.find_clips() for effect in clip.effects
+            if effect.metadata.get("AAF", {}).get("Operation", {}).get("IsTimeWarp")
+        )
+        del broken.metadata["AAF"]["Parameters"]["SpeedRatio"]
+
+        with self.assertLogs(
+            "otio_aaf_adapter.adapters.aaf_adapter.timewarp", level="WARNING"
+        ):
+            written = self._round_trip(timeline)
+        self.assertEqual(len(written), expected - 1)
 
 
 class SimplifyTests(unittest.TestCase):

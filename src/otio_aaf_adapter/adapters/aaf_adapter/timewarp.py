@@ -24,19 +24,35 @@ when creating timelines from scratch using OTIO without a reference AAF to base 
 This is done by reconstructing the OperationGroup using the values in metadata['AAF'].
 
 Because this is fairly complicated and also experimental it's in a separate module
-from the primary aaf_writer and is only called once in that class, making it easy to 
+from the primary aaf_writer and is only called once in that class, making it easy to
 disentangle it if needed, or add a runtime switch to disable it.
+
+Writer options (passed as keyword arguments to the AAF adapter's write_to_file):
+    timewarp_offset_map_adjust (bool, default False):
+        Also write the Avid OpGroupMotionCtlOffsetMapAdjust property captured
+        by the reader. Experimental: off until it has been verified in Avid.
 """
 
 import collections.abc
+import logging
 import uuid
+from fractions import Fraction
 
 import aaf2
 import aaf2.misc
 import aaf2.rational
 import opentimelineio as otio
 
-__all__ = ["wrap_input_segment"]
+__all__ = ["wrap_input_segment", "TIMEWARP_OFFSET_MAP_ADJUST_KWARG"]
+
+logger = logging.getLogger(__name__)
+
+# write_to_file keyword argument that enables writing OpGroupMotionCtlOffsetMapAdjust.
+TIMEWARP_OFFSET_MAP_ADJUST_KWARG = "timewarp_offset_map_adjust"
+
+# Avid OperationGroup extension property holding the Motion Control offset map
+# adjustment (an AAF Rational). Defined in pyaaf2's aaf2/model/ext/classdefs.py.
+OFFSET_MAP_ADJUST_PROPERTY = "OpGroupMotionCtlOffsetMapAdjust"
 
 # Avid Motion Control time warp definitions.
 # The two speed-map ParameterDefs are not listed in the
@@ -174,7 +190,7 @@ def _interpolation_def(aaf_file, interpolation_name):
     name = _INTERPOLATION_AUID_TO_NAME[auid]
     return _register_def(
         aaf_file,
-        lambda: aaf_file.dictionary.lookup_interperlationdef(name),# sic
+        lambda: aaf_file.dictionary.lookup_interperlationdef(name),  # sic
         lambda: aaf_file.create.InterpolationDef(auid, name, name),
     )
 
@@ -206,13 +222,29 @@ def _parameter_def(aaf_file, name, operation):
     )
 
 
+_INT32_MAX = 0x7FFFFFFF
+
+
 def _as_rational(value):
+    """Convert a metadata value (string such as "133/120", int, float or
+    Rational) into an AAFRational.
+
+    Floats are converted through their shortest decimal form rather than
+    passed to AAFRational directly. The reader produces these floats from
+    Avid's decimal-based rationals (e.g. 400476477/500000 -> 800.952954), so
+    the decimal form usually restores Avid's exact value. AAFRational(float)
+    instead converts the float's exact binary value and, when that doesn't
+    fit in int32, clamps the numerator and rescales the denominator, which
+    drifted keyframes by up to ~0.0002 frames.
     """
-        Convert a value expressed in the metadata as a string into an AAFRational.
-        AFRational accepts strings, including fractions like 133/120,
-        ints/floats and Rationals directly and, for
-        floats, picks an int32-safe rational approximation.
-    """
+    if isinstance(value, float):
+        fraction = Fraction(repr(value))
+        if (abs(fraction.numerator) > _INT32_MAX
+                or fraction.denominator > _INT32_MAX):
+            # Closest fraction whose numerator and denominator fit in int32.
+            max_denominator = max(1, _INT32_MAX // (int(abs(fraction)) + 1))
+            fraction = fraction.limit_denominator(max_denominator)
+        return aaf2.rational.AAFRational(fraction.numerator, fraction.denominator)
     return aaf2.rational.AAFRational(value)
 
 
@@ -228,7 +260,7 @@ def _build_varying_value(aaf_file, param_def, keyframed):
         point = aaf_file.create.ControlPoint()
         point["Time"].value = _as_rational(time)
         point["Value"].value = _as_rational(value)
-        # In the example AAFs so far Avid stamps every 
+        # In the example AAFs so far Avid stamps every
         # Motion Control control point with this edit hint.
         # not sure how consistent that will be...
         point["EditHint"].value = "RelativeFixed"
@@ -276,7 +308,8 @@ def _build_operation_def(aaf_file, operation, media_kind):
     )
 
 
-def wrap_input_segment(aaf_file, otio_clip, input_segment, media_kind):
+def wrap_input_segment(aaf_file, otio_clip, input_segment, media_kind,
+                       write_offset_map_adjust=False):
     """Wrap input_segment in a Motion Control OperationGroup if needed.
 
     Args:
@@ -284,11 +317,15 @@ def wrap_input_segment(aaf_file, otio_clip, input_segment, media_kind):
         otio_clip (otio.schema.Clip): the clip being transcribed.
         input_segment: the AAF segment (e.g. SourceClip) produced for the clip.
         media_kind (str): the track media kind ("Picture" / "Sound").
+        write_offset_map_adjust (bool): also write the captured
+            OpGroupMotionCtlOffsetMapAdjust value (experimental).
 
     Returns:
         A new aaf2.components.OperationGroup wrapping input_segment when
         the clip carries a Motion Control time warp; otherwise input_segment
-        unchanged.
+        unchanged. If the time warp cannot be reconstructed a warning is
+        logged and input_segment is returned unchanged, so the clip is
+        written without its time warp rather than failing the whole export.
     """
     effect = _find_timewarp_effect(otio_clip)
     if effect is None:
@@ -298,12 +335,25 @@ def wrap_input_segment(aaf_file, otio_clip, input_segment, media_kind):
     operation = aaf_md.get("Operation", {})
     parameters = aaf_md.get("Parameters", {})
 
-    op_def = _build_operation_def(aaf_file, operation, media_kind)
-    datadef = aaf_file.dictionary.lookup_datadef(str(media_kind))
-
     # The OperationGroup output length is the duration the
     # clip occupies on the timeline.
     length = int(otio_clip.duration().value)
+
+    # The input segment covers the source (unretimed) frames the warp consumes,
+    # not the retimed output length or the full media length.
+    input_length = _input_segment_length(length, parameters)
+    if input_length is None:
+        logger.warning(
+            "Unable to determine the source length of the Motion Control "
+            "time warp on clip '%s' (SpeedRatio: %r); writing the clip "
+            "without its time warp.",
+            otio_clip.name, parameters.get("SpeedRatio"),
+        )
+        return input_segment
+
+    op_def = _build_operation_def(aaf_file, operation, media_kind)
+    datadef = aaf_file.dictionary.lookup_datadef(str(media_kind))
+
     operation_group = aaf_file.create.OperationGroup(op_def, length)
     operation_group.media_kind = media_kind
     operation_group["DataDefinition"].value = datadef
@@ -321,25 +371,35 @@ def wrap_input_segment(aaf_file, otio_clip, input_segment, media_kind):
             parameter = _build_constant_value(aaf_file, param_def, name, value)
         operation_group.parameters.append(parameter)
 
-    # the length of the input_segment should be based on the duration
-    # of the source (unretimed) media, not the retimed output length
-    input_length = _input_segment_length(otio_clip)
-    if input_length is not None:
-        input_segment.length = input_length
-    else:
-        # throw an exception for now, probably represents a degenerate case
-        # will add better error reporting if this actually comes up.
-        raise Exception("Unable to determing segment length")
+    if write_offset_map_adjust:
+        offset_adjust = aaf_md.get(OFFSET_MAP_ADJUST_PROPERTY)
+        if offset_adjust is not None:
+            operation_group[OFFSET_MAP_ADJUST_PROPERTY].value = \
+                _as_rational(offset_adjust)
 
+    input_segment.length = input_length
     operation_group.segments.append(input_segment)
     return operation_group
 
 
-def _input_segment_length(otio_clip):
-    try:
-        available = otio_clip.available_range()
-    except Exception:
-        available = None
-    if available is None:
+def _input_segment_length(length, parameters):
+    """Number of source frames consumed by a Motion Control warp.
+
+    In Avid-authored AAFs SpeedRatio is the ratio of output (timeline) length
+    to input (source) length, negative for reverse motion, so the input length
+    is round(length / |SpeedRatio|). This held for every Motion Control group
+    in the sample and reference AAFs, including variable-speed ramps, position
+    graph warps, reverse warps and freeze frames.
+
+    Returns None if SpeedRatio is missing, zero or unparseable.
+    """
+    speed_ratio = parameters.get("SpeedRatio")
+    if speed_ratio is None:
         return None
-    return int(available.duration.value)
+    try:
+        speed_ratio = abs(Fraction(str(speed_ratio)))
+    except (ValueError, ZeroDivisionError):
+        return None
+    if speed_ratio == 0:
+        return None
+    return round(length / speed_ratio)
