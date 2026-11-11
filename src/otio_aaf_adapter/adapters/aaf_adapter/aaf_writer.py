@@ -79,6 +79,42 @@ def _physical_mob_id(tape_ref):
         return None
 
 
+# Essence descriptors of physical (tape/film/import) source mobs, as opposed to
+# the file source mobs that describe the essence a clip actually links to.
+_PHYSICAL_DESCRIPTORS = ("TapeDescriptor", "FilmDescriptor", "ImportDescriptor")
+
+
+def _file_mob_identity(media_reference):
+    """Return (MobID, name) of the file SourceMob a media reference describes.
+
+    The AAF reader stores the file SourceMob behind a clip's active media
+    reference in its metadata["AAF"] (ClassName "SourceMob", "MobID", "Name",
+    "EssenceDescription"). Code building timelines from scratch can supply the
+    same keys. Reusing that identity lets every clip that shares the media
+    point at one file SourceMob, as in an Avid-authored AAF.
+
+    Either value is None when absent. References describing a physical
+    (tape) source mob are ignored; those are handled by _physical_mob_reference.
+    """
+    if media_reference is None:
+        return None, None
+    aaf_meta = media_reference.metadata.get("AAF", {})
+    if aaf_meta.get("ClassName") != "SourceMob":
+        return None, None
+    descriptor = aaf_meta.get("EssenceDescription") or {}
+    if descriptor.get("ClassName") in _PHYSICAL_DESCRIPTORS:
+        return None, None
+
+    mob_id = None
+    if aaf_meta.get("MobID"):
+        try:
+            mob_id = aaf2.mobid.MobID(str(aaf_meta["MobID"]))
+        except Exception:
+            logger.warning("Ignoring invalid file SourceMob MobID %r on media "
+                           "reference '%s'", aaf_meta["MobID"], media_reference.name)
+    return mob_id, (aaf_meta.get("Name") or None)
+
+
 class _MarkerColor(NamedTuple):
     """An OTIO marker color translated to both of Avids marker color systems.
 
@@ -254,6 +290,9 @@ class AAFFileTranscriber:
         self.aaf_file.content.mobs.append(self.compositionmob)
         self._unique_mastermobs = {}
         self._unique_tapemobs = {}
+        # (file SourceMob MobID string, media kind) -> (filemob, filemob_slot)
+        self._unique_filemobs = {}
+        self._warned_file_mob_ids = set()
         self._clip_mob_ids_map = _gather_clip_mob_ids(input_otio, **kwargs)
         self.timewarp_offset_map_adjust = bool(
             kwargs.get(timewarp.TIMEWARP_OFFSET_MAP_ADJUST_KWARG, False))
@@ -261,6 +300,18 @@ class AAFFileTranscriber:
         # transcribe timeline comments onto composition mob
         self._transcribe_user_comments(input_otio, self.compositionmob)
         self._transcribe_mob_attributes(input_otio, self.compositionmob)
+
+    def _master_mob_id_strings(self):
+        """MobIDs (as strings) of every MasterMob this file will contain."""
+        if not hasattr(self, "_master_mob_id_cache"):
+            ids = set()
+            for mob_id in self._clip_mob_ids_map.values():
+                try:
+                    ids.add(str(aaf2.mobid.MobID(str(mob_id))))
+                except Exception:
+                    ids.add(str(mob_id))
+            self._master_mob_id_cache = ids
+        return self._master_mob_id_cache
 
     def _unique_mastermob(self, otio_clip):
         """Get a unique mastermob, identified by clip metadata mob id."""
@@ -775,9 +826,22 @@ class _TrackTranscriber:
                     f"embedding by implementing a "
                     f"'{hooks.HOOK_PRE_WRITE_TRANSCRIBE}' hook.")
         else:
-            tapemob, tapemob_slot = self._create_tapemob(otio_clip)
-            filemob, filemob_slot = self._create_filemob(otio_clip, tapemob,
-                                                         tapemob_slot)
+            # Clips whose media reference supplies the same file SourceMob
+            # MobID share one file SourceMob (and its tape mob slot), instead
+            # of each clip getting its own.
+            file_key, file_mob_id, file_mob_name = \
+                self._file_mob_identity_for(otio_clip)
+            shared = self.root_file_transcriber._unique_filemobs.get(file_key)
+            if shared is not None:
+                filemob, filemob_slot = shared
+            else:
+                tapemob, tapemob_slot = self._create_tapemob(otio_clip)
+                filemob, filemob_slot = self._create_filemob(
+                    otio_clip, tapemob, tapemob_slot,
+                    mob_id=file_mob_id, name=file_mob_name)
+                if file_key is not None:
+                    self.root_file_transcriber._unique_filemobs[file_key] = (
+                        filemob, filemob_slot)
             mastermob, mastermob_slot = self._create_mastermob(otio_clip,
                                                                filemob,
                                                                filemob_slot)
@@ -1151,14 +1215,59 @@ class _TrackTranscriber:
 
         return descriptor
 
-    def _create_filemob(self, otio_clip, tapemob, tapemob_slot):
+    def _file_mob_identity_for(self, otio_clip):
+        """Return (key, MobID, name) for the clip's file SourceMob.
+
+        key identifies a file SourceMob that clips sharing the same media can
+        share; it is None when the media reference supplies no usable MobID,
+        in which case the clip gets its own file SourceMob as before.
+        """
+        root = self.root_file_transcriber
+        mob_id, name = _file_mob_identity(otio_clip.media_reference)
+        if mob_id is None:
+            return None, None, name
+
+        mob_id_str = str(mob_id)
+        if mob_id_str in root._master_mob_id_strings():
+            # Without a MobID in clip.metadata["AAF"], the MasterMob takes the
+            # media reference's MobID (see _gather_clip_mob_ids), so the file
+            # SourceMob can't reuse it. Warn once per MobID, not per clip.
+            if mob_id_str not in root._warned_file_mob_ids:
+                root._warned_file_mob_ids.add(mob_id_str)
+                logger.warning(
+                    "File SourceMob MobID %s (clip '%s') is also used as a "
+                    "MasterMob ID, e.g. because the clip has no MobID in its "
+                    "metadata; writing new file SourceMob IDs instead",
+                    mob_id_str, otio_clip.name)
+            return None, None, name
+        for other_id, other_kind in root._unique_filemobs:
+            if other_id == mob_id_str and other_kind != self.media_kind:
+                # A MobID can only be used once in a file; a reference shared
+                # across picture and sound tracks gets a new ID for the second kind.
+                logger.warning(
+                    "File SourceMob MobID %s on clip '%s' is already used for %s "
+                    "media; writing a new file SourceMob ID for %s",
+                    mob_id_str, otio_clip.name, other_kind, self.media_kind)
+                return None, None, name
+        return (mob_id_str, self.media_kind), mob_id, name
+
+    def _create_filemob(self, otio_clip, tapemob, tapemob_slot, mob_id=None, name=None):
         """
         Return a file sourcemob for an otio Clip. Needs a tapemob and tapemob slot.
+
+        Args:
+            mob_id: MobID to give the file SourceMob (a new one if None).
+            name: name to give the file SourceMob (left unset if None).
 
         Returns:
             Returns a tuple of (FileMob, FileMobSlot)
         """
         filemob = self.aaf_file.create.SourceMob()
+        if mob_id is not None:
+            # set before adding to the file: content.mobs is keyed by MobID
+            filemob.mob_id = mob_id
+        if name:
+            filemob.name = name
         self.aaf_file.content.mobs.append(filemob)
 
         filemob.descriptor = self.default_descriptor(otio_clip)

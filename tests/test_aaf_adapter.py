@@ -3152,6 +3152,204 @@ class AAFWriterTests(unittest.TestCase):
         self.assertEqual(tape["locators"], 1)
 
 
+class FileSourceMobWriterTests(unittest.TestCase):
+    """File SourceMobs take their MobID/Name from the media reference's
+    metadata["AAF"] and are shared by every clip that references them."""
+
+    RATE = 24
+    PHYSICAL = ("TapeDescriptor", "ImportDescriptor")
+
+    def _clip(self, name, media_reference, master_mob_id=None):
+        media_range = otio.opentime.TimeRange(
+            otio.opentime.RationalTime(0, self.RATE),
+            otio.opentime.RationalTime(100, self.RATE),
+        )
+        clip = otio.schema.Clip(
+            name=name,
+            source_range=otio.opentime.TimeRange(
+                otio.opentime.RationalTime(10, self.RATE),
+                otio.opentime.RationalTime(20, self.RATE),
+            ),
+            media_reference=media_reference,
+        )
+        clip.media_reference.available_range = media_range
+        if master_mob_id is not None:
+            clip.metadata["AAF"] = {"MobID": str(master_mob_id)}
+        return clip
+
+    @staticmethod
+    def _reference(mob_id=None, name=None, descriptor="CDCIDescriptor"):
+        ref = otio.schema.ExternalReference(target_url="file:///media/shared.mxf")
+        if mob_id is not None or name is not None:
+            ref.metadata["AAF"] = {
+                "ClassName": "SourceMob",
+                "EssenceDescription": {"ClassName": descriptor},
+            }
+            if mob_id is not None:
+                ref.metadata["AAF"]["MobID"] = str(mob_id)
+            if name is not None:
+                ref.metadata["AAF"]["Name"] = name
+        return ref
+
+    def _write(self, tracks):
+        timeline = otio.schema.Timeline(tracks=tracks)
+        fd, tmp_aaf_path = tempfile.mkstemp(prefix="filemob_", suffix=".aaf")
+        os.close(fd)
+        self.addCleanup(os.remove, tmp_aaf_path)
+        otio.adapters.write_to_file(timeline, tmp_aaf_path, use_empty_mob_ids=True)
+        return tmp_aaf_path
+
+    def _file_mobs(self, aaf_path):
+        """{MobID string: (name, descriptor class)} of the file SourceMobs."""
+        with aaf2.open(aaf_path) as aaf_file:
+            return {
+                str(mob.mob_id): (mob.name, type(mob.descriptor).__name__)
+                for mob in aaf_file.content.sourcemobs()
+                if type(mob.descriptor).__name__ not in self.PHYSICAL
+            }
+
+    def test_shared_reference_writes_one_file_mob(self):
+        """Clips sharing a media reference with a SourceMob identity share one
+        file SourceMob carrying that MobID and Name, across tracks."""
+        file_mob_id = aaf2.mobid.MobID.new()
+        master_mob_id = aaf2.mobid.MobID.new()
+        shared = self._reference(file_mob_id, "A001_C002_v002.05")
+        tracks = [
+            otio.schema.Track(children=[
+                self._clip("clip_%d_%d" % (t, i), shared.clone(), master_mob_id)
+                for i in range(3)
+            ])
+            for t in range(2)
+        ]
+        aaf_path = self._write(tracks)
+
+        self.assertEqual(self._file_mobs(aaf_path), {
+            str(file_mob_id): ("A001_C002_v002.05", "CDCIDescriptor"),
+        })
+        with aaf2.open(aaf_path) as aaf_file:
+            tape_mobs = [m for m in aaf_file.content.sourcemobs()
+                         if type(m.descriptor).__name__ in self.PHYSICAL]
+            # one tape mob, with one link slot (plus its tape/timecode slots),
+            # not one slot per clip
+            self.assertEqual(len(tape_mobs), 1)
+            self.assertLessEqual(len(list(tape_mobs[0].slots)), 3)
+
+        reread = otio.adapters.read_from_file(aaf_path)
+        for clip in reread.find_clips():
+            aaf_meta = clip.media_reference.metadata["AAF"]
+            self.assertEqual(aaf_meta["MobID"], str(file_mob_id))
+            self.assertEqual(aaf_meta["Name"], "A001_C002_v002.05")
+
+    def test_reference_without_identity_keeps_one_file_mob_per_clip(self):
+        tracks = [otio.schema.Track(children=[
+            self._clip("clip_%d" % i, self._reference()) for i in range(3)
+        ])]
+        file_mobs = self._file_mobs(self._write(tracks))
+        self.assertEqual(len(file_mobs), 3)
+
+    def test_name_without_mob_id_is_used(self):
+        tracks = [otio.schema.Track(children=[
+            self._clip("clip_0", self._reference(name="named_file_mob"))
+        ])]
+        names = [name for name, _ in self._file_mobs(self._write(tracks)).values()]
+        self.assertEqual(names, ["named_file_mob"])
+
+    def test_physical_source_mob_identity_is_ignored(self):
+        """A reference describing a tape/import mob never supplies the file
+        mob's identity (tape mobs come from MissingReferences instead)."""
+        from otio_aaf_adapter.adapters.aaf_adapter.aaf_writer import (
+            _file_mob_identity,
+        )
+        mob_id = aaf2.mobid.MobID.new()
+        for descriptor in ("TapeDescriptor", "ImportDescriptor", "FilmDescriptor"):
+            with self.subTest(descriptor=descriptor):
+                self.assertEqual(
+                    _file_mob_identity(self._reference(mob_id, "TAPE", descriptor)),
+                    (None, None))
+        self.assertEqual(
+            _file_mob_identity(self._reference(mob_id, "FILE", "CDCIDescriptor")),
+            (mob_id, "FILE"))
+        self.assertEqual(_file_mob_identity(self._reference()), (None, None))
+
+    def test_same_mob_id_on_picture_and_sound_gets_a_new_id(self):
+        file_mob_id = aaf2.mobid.MobID.new()
+        master_mob_id = aaf2.mobid.MobID.new()
+        ref = self._reference(file_mob_id, "shared")
+        tracks = [
+            otio.schema.Track(children=[self._clip("v", ref.clone(), master_mob_id)],
+                              kind=otio.schema.TrackKind.Video),
+            otio.schema.Track(children=[self._clip("a", ref.clone(), master_mob_id)],
+                              kind=otio.schema.TrackKind.Audio),
+        ]
+        with self.assertLogs(
+            "otio_aaf_adapter.adapters.aaf_adapter.aaf_writer", level="WARNING"
+        ):
+            file_mobs = self._file_mobs(self._write(tracks))
+        self.assertEqual(len(file_mobs), 2)
+        self.assertEqual(file_mobs[str(file_mob_id)], ("shared", "CDCIDescriptor"))
+
+    def test_mob_id_colliding_with_master_mob_gets_a_new_id(self):
+        mob_id = aaf2.mobid.MobID.new()
+        tracks = [otio.schema.Track(children=[
+            self._clip("clip_0", self._reference(mob_id, "file"), master_mob_id=mob_id)
+        ])]
+        with self.assertLogs(
+            "otio_aaf_adapter.adapters.aaf_adapter.aaf_writer", level="WARNING"
+        ):
+            file_mobs = self._file_mobs(self._write(tracks))
+        self.assertNotIn(str(mob_id), file_mobs)
+        self.assertEqual([name for name, _ in file_mobs.values()], ["file"])
+
+    def test_reference_mob_id_stays_master_id_when_clip_has_none(self):
+        """Existing behaviour: without clip.metadata["AAF"]["MobID"] the
+        MasterMob uses the reference's MobID, so the file mobs get new IDs;
+        one warning, not one per clip."""
+        mob_id = aaf2.mobid.MobID.new()
+        ref = self._reference(mob_id, "file")
+        tracks = [otio.schema.Track(children=[
+            self._clip("clip_%d" % i, ref.clone()) for i in range(3)
+        ])]
+        with self.assertLogs(
+            "otio_aaf_adapter.adapters.aaf_adapter.aaf_writer", level="WARNING"
+        ) as logs:
+            aaf_path = self._write(tracks)
+        self.assertEqual(len([r for r in logs.output if "MasterMob ID" in r]), 1)
+        with aaf2.open(aaf_path) as aaf_file:
+            self.assertEqual([str(m.mob_id) for m in aaf_file.content.mastermobs()],
+                             [str(mob_id)])
+        self.assertNotIn(str(mob_id), self._file_mobs(aaf_path))
+
+    def test_round_trip_preserves_shared_file_mobs(self):
+        """AAF -> OTIO -> AAF keeps each file SourceMob's MobID and Name, and
+        clips that shared one in the original still share one."""
+        # multiple_markers: 10 clips share SLUG.aaf; keyframed_properties: 18 clips
+        # share one file. Clips whose reference carries no SourceMob metadata
+        # still get their own unnamed file mob, so only identified ones are checked.
+        for sample_path in (MULTIPLE_MARKERS_PATH, KEYFRAMED_PROPERTIES_PATH):
+            with self.subTest(sample=os.path.basename(sample_path)):
+                timeline = otio.adapters.read_from_file(sample_path)
+                expected = {}
+                for clip in timeline.find_clips():
+                    aaf_meta = clip.media_reference.metadata.get("AAF", {})
+                    if aaf_meta.get("ClassName") == "SourceMob":
+                        expected[aaf_meta["MobID"]] = aaf_meta.get("Name")
+                self.assertTrue(expected)
+
+                fd, tmp_aaf_path = tempfile.mkstemp(prefix="filemob_rt_", suffix=".aaf")
+                os.close(fd)
+                self.addCleanup(os.remove, tmp_aaf_path)
+                otio.adapters.write_to_file(timeline, tmp_aaf_path)
+
+                written = self._file_mobs(tmp_aaf_path)
+                for mob_id, name in expected.items():
+                    self.assertIn(mob_id, written)
+                    self.assertEqual(written[mob_id][0], name)
+                with aaf2.open(tmp_aaf_path) as aaf_file:
+                    self.assertEqual(
+                        len({str(m.mob_id) for m in aaf_file.content.sourcemobs()}),
+                        len(list(aaf_file.content.sourcemobs())))
+
+
 class TimewarpWriterTests(unittest.TestCase):
     """Round trips of Avid Motion Control time warps (aaf_adapter/timewarp.py)."""
 
