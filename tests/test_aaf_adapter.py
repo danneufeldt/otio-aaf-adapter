@@ -3254,6 +3254,179 @@ class FileSourceMobWriterTests(unittest.TestCase):
         names = [name for name, _ in self._file_mobs(self._write(tracks)).values()]
         self.assertEqual(names, ["named_file_mob"])
 
+    def test_tape_essence_description_on_active_reference(self):
+        """A clip whose active reference describes a tape mob (e.g. a master
+        mob that points straight at a tape mob) used to fail on video tracks
+        with KeyError 'ImageAspectRatio'. The file mob now gets a default
+        picture/sound descriptor and the clip's metadata is left untouched."""
+        master_mob_id = aaf2.mobid.MobID.new()
+
+        def tape_ref():
+            ref = otio.schema.MissingReference(name="TAPE_01")
+            ref.metadata["AAF"] = {
+                "ClassName": "SourceMob",
+                "Name": "TAPE_01",
+                "MobID": str(aaf2.mobid.MobID.new()),
+                "EssenceDescription": {"ClassName": "TapeDescriptor",
+                                       "FormFactor": "VideoTape"},
+            }
+            return ref
+
+        tracks = [
+            otio.schema.Track(children=[self._clip("v", tape_ref(), master_mob_id)],
+                              kind=otio.schema.TrackKind.Video),
+            otio.schema.Track(children=[self._clip("a", tape_ref(), master_mob_id)],
+                              kind=otio.schema.TrackKind.Audio),
+        ]
+        metadata_before = [
+            otio.adapters.write_to_string(t, "otio_json") for t in tracks]
+
+        aaf_path = self._write(tracks)
+
+        descriptors = sorted(desc for _, desc in self._file_mobs(aaf_path).values())
+        self.assertEqual(descriptors, ["CDCIDescriptor", "PCMDescriptor"])
+        self.assertEqual(
+            [otio.adapters.write_to_string(t, "otio_json") for t in tracks],
+            metadata_before)
+
+    def test_tape_only_chain_round_trip(self):
+        """MasterMob -> tape SourceMob with no file mob: reads back with the
+        tape as the active reference, and is written back with the tape mob's
+        own name and MobID."""
+        fd, src_path = tempfile.mkstemp(prefix="tape_only_", suffix=".aaf")
+        os.close(fd)
+        self.addCleanup(os.remove, src_path)
+        with aaf2.open(src_path, "w") as aaf_file:
+            tape = aaf_file.create.SourceMob()
+            tape.name = "TAPE_01"
+            tape.descriptor = aaf_file.create.TapeDescriptor()
+            tape_slot, tc_slot = tape.create_tape_slots("TAPE_01", 24, 24)
+            tape_slot.segment.length = 1000
+            tc_slot.segment.length = 1000
+            aaf_file.content.mobs.append(tape)
+            tape_mob_id = str(tape.mob_id)
+            master = aaf_file.create.MasterMob("clip_A")
+            aaf_file.content.mobs.append(master)
+            master_slot = master.create_timeline_slot(24)
+            master_slot.segment = tape.create_source_clip(
+                slot_id=tape_slot.slot_id, start=10, length=100)
+            comp = aaf_file.create.CompositionMob("seq")
+            comp.usage = "Usage_TopLevel"
+            aaf_file.content.mobs.append(comp)
+            sequence = aaf_file.create.Sequence(media_kind="picture")
+            comp.create_timeline_slot(24).segment = sequence
+            sequence.components.append(master.create_source_clip(
+                slot_id=master_slot.slot_id, start=5, length=50))
+
+        timeline = otio.adapters.read_from_file(src_path)
+        clip = next(iter(timeline.find_clips()))
+        self.assertIsInstance(clip.media_reference, otio.schema.MissingReference)
+
+        fd, out_path = tempfile.mkstemp(prefix="tape_only_rt_", suffix=".aaf")
+        os.close(fd)
+        self.addCleanup(os.remove, out_path)
+        otio.adapters.write_to_file(timeline, out_path)
+
+        with aaf2.open(out_path) as aaf_file:
+            tapes = [(m.name, str(m.mob_id)) for m in aaf_file.content.sourcemobs()
+                     if type(m.descriptor).__name__ in self.PHYSICAL]
+        self.assertEqual(tapes, [("TAPE_01", tape_mob_id)])
+        reread = next(iter(otio.adapters.read_from_file(out_path).find_clips()))
+        self.assertEqual(reread.source_range, clip.source_range)
+
+    def _tape_layout_timeline(self, tape_range):
+        """One 23.976 clip on an MXF at 12:58:13:00 (1120632) for 684 frames,
+        with a non-active tape MissingReference covering tape_range."""
+        rate = 24000 / 1001
+        file_mob_id = aaf2.mobid.MobID.new()
+        media_range = otio.opentime.TimeRange(
+            otio.opentime.RationalTime(1120632, rate),
+            otio.opentime.RationalTime(684, rate))
+        ref = otio.schema.ExternalReference(
+            target_url="file:///media/A001.mxf", available_range=media_range)
+        ref.metadata["AAF"] = {
+            "ClassName": "SourceMob", "MobID": str(file_mob_id), "Name": "",
+            "EssenceDescription": {"ClassName": "CDCIDescriptor"},
+        }
+        tape = otio.schema.MissingReference(name="TAPE_A001",
+                                            available_range=tape_range)
+        tape.metadata["AAF"] = {
+            "ClassName": "SourceMob", "Name": "TAPE_A001",
+            "MobID": str(aaf2.mobid.MobID.new()),
+            "EssenceDescription": {"ClassName": "TapeDescriptor"},
+        }
+        clip = otio.schema.Clip(
+            name="A001",
+            source_range=otio.opentime.TimeRange(
+                otio.opentime.RationalTime(1120632 + 100, rate),
+                otio.opentime.RationalTime(50, rate)),
+        )
+        clip.set_media_references({"DEFAULT_MEDIA": ref, "TAPE_A001": tape},
+                                  "DEFAULT_MEDIA")
+        clip.metadata["AAF"] = {"MobID": str(aaf2.mobid.MobID.new())}
+        return clip, file_mob_id
+
+    def _tape_layout(self, aaf_path, file_mob_id):
+        with aaf2.open(aaf_path) as aaf_file:
+            file_mob = next(m for m in aaf_file.content.sourcemobs()
+                            if str(m.mob_id) == str(file_mob_id))
+            file_clip = list(file_mob.slots)[0].segment
+            tape = file_clip.mob
+            tape_slots = sorted(
+                (slot.slot_id, type(slot.segment).__name__,
+                 int(slot.segment.start or 0), int(slot.segment.length))
+                for slot in tape.slots)
+            return {
+                "file_name": file_mob.name,
+                "file_clip": (int(file_clip.start), int(file_clip.length),
+                              file_clip.slot_id),
+                "tape_slots": tape_slots,
+            }
+
+    def test_full_length_tape_reference_offsets_file_mob(self):
+        """With a full-length tape reference the file mob starts at the
+        media's offset into the tape (the Avid layout), the tape mob has one
+        picture slot, and the source range reads back unchanged."""
+        rate = 24000 / 1001
+        full_tape = otio.opentime.TimeRange(
+            otio.opentime.RationalTime(0, rate),
+            otio.opentime.RationalTime(10368000, rate))
+        clip, file_mob_id = self._tape_layout_timeline(full_tape)
+        aaf_path = self._write([otio.schema.Track(children=[clip])])
+
+        layout = self._tape_layout(aaf_path, file_mob_id)
+        self.assertEqual(layout["file_clip"], (1120632, 684, 1))
+        self.assertEqual(layout["tape_slots"], [
+            (1, "SourceClip", 0, 10368000),
+            (2, "Timecode", 0, 10368000),
+        ])
+        self.assertEqual(layout["file_name"], "")
+
+        reread = next(iter(otio.adapters.read_from_file(aaf_path).find_clips()))
+        self.assertEqual(reread.source_range, clip.source_range)
+        self.assertEqual(reread.media_reference.available_range.start_time.value,
+                         1120632)
+        self.assertEqual(reread.media_reference.metadata["AAF"]["Name"], "")
+
+    def test_matching_tape_range_keeps_zero_offset(self):
+        """When the tape reference covers just the media (AAF round trips),
+        the file mob starts at 0 over the whole tape slot, as before."""
+        rate = 24000 / 1001
+        media_only = otio.opentime.TimeRange(
+            otio.opentime.RationalTime(1120632, rate),
+            otio.opentime.RationalTime(684, rate))
+        clip, file_mob_id = self._tape_layout_timeline(media_only)
+        aaf_path = self._write([otio.schema.Track(children=[clip])])
+
+        layout = self._tape_layout(aaf_path, file_mob_id)
+        self.assertEqual(layout["file_clip"], (0, 684, 1))
+        self.assertEqual(layout["tape_slots"], [
+            (1, "SourceClip", 1120632, 684),
+            (2, "Timecode", 1120632, 684),
+        ])
+        reread = next(iter(otio.adapters.read_from_file(aaf_path).find_clips()))
+        self.assertEqual(reread.source_range, clip.source_range)
+
     def test_physical_source_mob_identity_is_ignored(self):
         """A reference describing a tape/import mob never supplies the file
         mob's identity (tape mobs come from MissingReferences instead)."""

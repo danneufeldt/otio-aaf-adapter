@@ -60,7 +60,25 @@ def _physical_mob_reference(otio_clip):
             continue
         if isinstance(ref, otio.schema.MissingReference):
             return ref
+
+    # A MasterMob that points straight at a tape mob (no file mob) reads back
+    # with the tape as the *active* reference; use it for the tape identity.
+    active = otio_clip.media_reference
+    descriptor = active.metadata.get("AAF", {}).get("EssenceDescription") or {}
+    if (isinstance(active, otio.schema.MissingReference)
+            and descriptor.get("ClassName") in _PHYSICAL_DESCRIPTORS):
+        return active
     return None
+
+
+def _tape_range(otio_clip):
+    """Range of the clip's physical (tape) source: the tape reference's
+    available range when there is one, otherwise the media reference's."""
+    tape_range = otio_clip.media_reference.available_range
+    tape_ref = _physical_mob_reference(otio_clip)
+    if tape_ref is not None and tape_ref.available_range is not None:
+        tape_range = tape_ref.available_range
+    return tape_range
 
 
 def _physical_mob_id(tape_ref):
@@ -112,7 +130,9 @@ def _file_mob_identity(media_reference):
         except Exception:
             logger.warning("Ignoring invalid file SourceMob MobID %r on media "
                            "reference '%s'", aaf_meta["MobID"], media_reference.name)
-    return mob_id, (aaf_meta.get("Name") or None)
+    # Name is passed through verbatim when present, including "" (Avid writes
+    # unnamed file mobs with an empty name); None means the key is absent.
+    return mob_id, aaf_meta.get("Name")
 
 
 class _MarkerColor(NamedTuple):
@@ -1158,15 +1178,22 @@ class _TrackTranscriber:
             Returns a tuple of (TapeMob, TapeMobSlot)
         """
         tapemob = self.root_file_transcriber._unique_tapemob(otio_clip)
-        tapemob_slot = tapemob.create_empty_slot(self.edit_rate, self.media_kind)
+
+        # Reuse the tape mob's slot for this media kind: create_tape_slots()
+        # already made picture slot 1 (12 hours long by default), and a tape mob
+        # shared by several clips needs only one slot per media kind.
+        for tapemob_slot in tapemob.slots:
+            segment = tapemob_slot.segment
+            same_kind = (str(segment.media_kind).lower()
+                         == str(self.media_kind).lower())
+            if isinstance(segment, aaf2.components.SourceClip) and same_kind:
+                break
+        else:
+            tapemob_slot = tapemob.create_empty_slot(self.edit_rate, self.media_kind)
 
         # Prefer the range from the tape if it is available
         # otherwise fall back to the range on the clip's media reference
-        tape_range = otio_clip.media_reference.available_range
-        tape_ref = _physical_mob_reference(otio_clip)
-        if tape_ref is not None and tape_ref.available_range is not None:
-            tape_range = tape_ref.available_range
-
+        tape_range = _tape_range(otio_clip)
         tapemob_slot.segment.length = int(tape_range.duration.value)
         tapemob_slot.segment.start = int(tape_range.start_time.value)
         return tapemob, tapemob_slot
@@ -1215,6 +1242,30 @@ class _TrackTranscriber:
 
         return descriptor
 
+    def _essence_description(self, otio_clip, accepted_base):
+        """Return a copy of the media reference's
+        metadata["AAF"]["EssenceDescription"], or {} if it doesn't describe a
+        descriptor derived from accepted_base (e.g. a TapeDescriptor, when the
+        active reference describes a tape mob rather than a file mob).
+
+        The file SourceMob's descriptor is built from this dict, so a foreign
+        descriptor would either fail (picture properties on a TapeDescriptor)
+        or carry properties that don't belong to it. A copy is returned so
+        filling in defaults never modifies the clip's metadata.
+        """
+        descriptor_dict = otio_clip.media_reference.metadata.get(
+            "AAF", {}).get("EssenceDescription") or {}
+        class_name = descriptor_dict.get("ClassName")
+        if class_name:
+            descriptor_cls = getattr(aaf2.essence, class_name, None)
+            if descriptor_cls is None or not issubclass(descriptor_cls, accepted_base):
+                logger.debug(
+                    "Ignoring %s essence description on clip '%s'; writing a "
+                    "default %s descriptor", class_name, otio_clip.name,
+                    accepted_base.__name__)
+                return {}
+        return dict(descriptor_dict)
+
     def _file_mob_identity_for(self, otio_clip):
         """Return (key, MobID, name) for the clip's file SourceMob.
 
@@ -1251,6 +1302,34 @@ class _TrackTranscriber:
                 return None, None, name
         return (mob_id_str, self.media_kind), mob_id, name
 
+    def _filemob_tape_span(self, otio_clip, tapemob_slot):
+        """(StartTime, Length) of the file mob's SourceClip into its tape slot.
+
+        The media covers media_reference.available_range; the tape covers the
+        tape range (see _tape_range). When the tape is longer than the media
+        (e.g. a full-length tape reference), the file mob starts at the
+        media's offset into the tape, as in Avid-written AAFs. When the two
+        ranges match, as in AAF round trips, this is StartTime 0 over the
+        whole tape slot, the original behaviour.
+        """
+        tape_length = int(tapemob_slot.segment.length)
+        media_range = otio_clip.media_reference.available_range
+        tape_range = _tape_range(otio_clip)
+        if media_range is None or tape_range is None or media_range == tape_range:
+            return 0, tape_length
+
+        rate = tape_range.start_time.rate
+        offset = int(round(
+            (media_range.start_time - tape_range.start_time).rescaled_to(rate).value))
+        length = int(round(media_range.duration.rescaled_to(rate).value))
+        if offset < 0 or offset + length > tape_length:
+            logger.warning(
+                "Media range %s of clip '%s' is not inside its tape range %s; "
+                "linking the file SourceMob to the whole tape",
+                media_range, otio_clip.name, tape_range)
+            return 0, tape_length
+        return offset, length
+
     def _create_filemob(self, otio_clip, tapemob, tapemob_slot, mob_id=None, name=None):
         """
         Return a file sourcemob for an otio Clip. Needs a tapemob and tapemob slot.
@@ -1266,15 +1345,17 @@ class _TrackTranscriber:
         if mob_id is not None:
             # set before adding to the file: content.mobs is keyed by MobID
             filemob.mob_id = mob_id
-        if name:
-            filemob.name = name
+        if name is not None:
+            filemob.name = name  # verbatim, including ""
         self.aaf_file.content.mobs.append(filemob)
 
         filemob.descriptor = self.default_descriptor(otio_clip)
         filemob_slot = filemob.create_timeline_slot(self.edit_rate)
+        start, length = self._filemob_tape_span(otio_clip, tapemob_slot)
         filemob_clip = filemob.create_source_clip(
             slot_id=filemob_slot.slot_id,
-            length=tapemob_slot.segment.length,
+            start=start,
+            length=length,
             media_kind=tapemob_slot.segment.media_kind)
         filemob_clip.mob = tapemob
         filemob_clip.slot = tapemob_slot
@@ -1368,8 +1449,8 @@ class VideoTrackTranscriber(_TrackTranscriber):
         return timeline_mobslot, sequence
 
     def default_descriptor(self, otio_clip):
-        descriptor_dict = otio_clip.media_reference.metadata.get("AAF", {}).get(
-            "EssenceDescription", {})
+        descriptor_dict = self._essence_description(
+            otio_clip, aaf2.essence.DigitalImageDescriptor)
 
         descriptor_class = descriptor_dict.get("ClassName")
         if descriptor_class:
@@ -1587,8 +1668,8 @@ class AudioTrackTranscriber(_TrackTranscriber):
 
     def default_descriptor(self, otio_clip):
         descriptor = self.aaf_file.create.PCMDescriptor()
-        descriptor_dict = otio_clip.media_reference.metadata.get("AAF", {}).get(
-            "EssenceDescription", {})
+        descriptor_dict = self._essence_description(
+            otio_clip, aaf2.essence.FileDescriptor)
 
         sample_rate = float(aaf2.rational.AAFRational(
             descriptor_dict.get("SampleRate", 48000)))
