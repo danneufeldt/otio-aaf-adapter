@@ -6,6 +6,7 @@
 Specifies how to transcribe an OpenTimelineIO file into an AAF file.
 """
 from . import hooks
+from . import timewarp
 
 from pathlib import Path
 from typing import Tuple
@@ -254,6 +255,8 @@ class AAFFileTranscriber:
         self._unique_mastermobs = {}
         self._unique_tapemobs = {}
         self._clip_mob_ids_map = _gather_clip_mob_ids(input_otio, **kwargs)
+        self.timewarp_offset_map_adjust = bool(
+            kwargs.get(timewarp.TIMEWARP_OFFSET_MAP_ADJUST_KWARG, False))
 
         # transcribe timeline comments onto composition mob
         self._transcribe_user_comments(input_otio, self.compositionmob)
@@ -596,7 +599,10 @@ class _TrackTranscriber:
             return transition
         elif isinstance(otio_child, otio.schema.Clip):
             source_clip = self.aaf_sourceclip(otio_child)
-            return source_clip
+            return timewarp.wrap_input_segment(
+                self.aaf_file, otio_child, source_clip, self.media_kind,
+                write_offset_map_adjust=(
+                    self.root_file_transcriber.timewarp_offset_map_adjust))
         elif isinstance(otio_child, otio.schema.Track):
             sequence = self.aaf_sequence(otio_child)
             return sequence
